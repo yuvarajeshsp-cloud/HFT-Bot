@@ -253,6 +253,7 @@ double CalculateBasketLots(ENUM_BASKET_DIRECTION direction);
 double GetLastEntryPrice(ENUM_BASKET_DIRECTION direction);
 void   RecalculateBasketMetrics(ENUM_BASKET_DIRECTION direction);
 void   CheckForBasketTP();
+void   SyncBrokerSideTakeProfit(ENUM_BASKET_DIRECTION direction);
 double GetMinimumProfitThreshold();
 void   BeginBasketClose();
 void   ProcessBasketClosing();
@@ -382,6 +383,7 @@ void OnTick()
       case STATE_BUY_ACTIVE:
       case STATE_SELL_ACTIVE:
          RecalculateBasketMetrics(g_basketDirection);
+         SyncBrokerSideTakeProfit(g_basketDirection);
 
          if(EnableTradingHours && CloseBasketAtSessionEnd && !IsWithinTradingHours())
             BeginBasketClose();
@@ -756,6 +758,7 @@ void ActivateBasket(ENUM_BASKET_DIRECTION direction, bool cancelOpposite)
 {
    g_basketDirection = direction;
    RecalculateBasketMetrics(direction);
+   SyncBrokerSideTakeProfit(direction);
    g_state = (direction == BASKET_BUY) ? STATE_BUY_ACTIVE : STATE_SELL_ACTIVE;
 
    if(cancelOpposite)
@@ -1306,6 +1309,36 @@ void CheckForBasketTP()
    }
 }
 
+// When UseVirtualBasketTP=false the EA does not run its own coordinated
+// close (see CheckForBasketTP above), so the basket needs a real exit
+// mechanism instead: keep every position's broker-side TP in sync with the
+// current weighted-average basket TP. Note this trades away two things the
+// virtual mode provides: positions then close individually as each hits
+// the shared TP price (not guaranteed atomically together), and the
+// commission/swap-aware MinimumBasketProfit check is not applied, since
+// the broker has no knowledge of it.
+void SyncBrokerSideTakeProfit(ENUM_BASKET_DIRECTION direction)
+{
+   if(UseVirtualBasketTP) return;
+   if(direction == BASKET_NONE || g_basketTP <= 0) return;
+
+   BasketPosition arr[];
+   int count = FindBasketPositions(direction, arr);
+
+   for(int i = 0; i < count; i++)
+   {
+      if(!PositionSelectByTicket(arr[i].ticket)) continue;
+
+      double curSL = PositionGetDouble(POSITION_SL);
+      double curTP = PositionGetDouble(POSITION_TP);
+      if(MathAbs(curTP - g_basketTP) <= g_tickSize / 2.0) continue; // already in sync
+
+      if(!trade.PositionModify(arr[i].ticket, curSL, g_basketTP))
+         LogError(StringFormat("Failed to sync broker-side TP on position %I64u, retcode=%u.",
+                   arr[i].ticket, trade.ResultRetcode()));
+   }
+}
+
 void BeginBasketClose()
 {
    if(g_state == STATE_TP_CLOSING) return;
@@ -1504,6 +1537,7 @@ void OpenAveragingPosition(ENUM_BASKET_DIRECTION direction, double lot, int leve
                  DirectionToString(direction), level, execVolume, PxStr(execPrice)));
 
    RecalculateBasketMetrics(direction);
+   SyncBrokerSideTakeProfit(direction);
    WriteTradeLog("BASKET", StringFormat("Average=%s TP=%s", PxStr(g_weightedAverage), PxStr(g_basketTP)));
 
    if(g_currentLevel >= MaximumMartingaleLevels)

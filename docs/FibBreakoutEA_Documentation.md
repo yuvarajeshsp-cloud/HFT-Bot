@@ -132,6 +132,33 @@ same logic once at `OnInit()` for restart recovery (see §8).
 7. **Cooldown → new cycle**: after `CooldownAfterTP` seconds, state returns
    to `IDLE` and step 1 repeats with brand-new market prices.
 
+### 5a. Two take-profit modes (`UseVirtualBasketTP`)
+
+- **`UseVirtualBasketTP = true` (default, preferred).** `CheckForBasketTP()`
+  runs every tick: it computes the weighted average and TP from live
+  positions, and only when price reaches the TP **and** real net profit
+  (P/L + swap + commission) meets `MinimumBasketProfit` does it call
+  `BeginBasketClose()`, which closes every basket position together. No
+  broker-side TP is ever placed on the individual positions (`tp=0` at
+  open) — the EA is the only thing that can close the basket at a profit.
+- **`UseVirtualBasketTP = false`.** The EA does not run its own closing
+  logic at all. Instead, `SyncBrokerSideTakeProfit()` keeps every basket
+  position's broker-side TP field set to the current basket TP price —
+  called whenever a basket activates, whenever a new averaging position
+  opens, and every tick while a basket is active (so a shift in the
+  weighted average from a new fill immediately re-prices the TP on the
+  *existing* positions too, not just the newest one). The broker then
+  closes each position as its TP is hit. Because every position shares the
+  same TP price, they will typically all fill within the same tick/moment
+  in a normal market — but this is **not** the same guarantee as the
+  virtual mode: positions can close individually rather than atomically
+  together, and `MinimumBasketProfit`/commission-aware verification is
+  **not** applied in this mode (the broker's TP order has no visibility
+  into swap/commission). Choose this mode only if you specifically want a
+  broker-enforced TP that survives the EA/terminal being offline; the
+  trade-off is losing the coordinated-close and profit-verification
+  guarantees of virtual mode.
+
 ## 6. Risk management (checked before every trade)
 
 `PassRiskChecksForAveraging()` and `CanStartNewCycle()` gate every new
@@ -225,7 +252,7 @@ averaging-blocked.
 | Take Profit | `BasketTPDistance` | 0.50 | TP distance from the weighted average. |
 | | `MinimumBasketProfit` | 0.00 | Minimum net profit required to actually close at TP. |
 | | `MinimumBasketProfitMode` | Currency | Currency / % of equity / price-distance only. |
-| | `UseVirtualBasketTP` | true | Use EA-managed (not broker-side) TP logic. |
+| | `UseVirtualBasketTP` | true | `true`: EA closes the whole basket together once real net profit (incl. swap/commission) meets `MinimumBasketProfit`. `false`: EA instead keeps a broker-side TP order on every position, synced to the current basket TP price — positions then close individually as the broker fills each TP, without the commission-aware profit check. See §5a. |
 | Averaging | `GridStep` | 0.50 | Distance between averaging levels. |
 | | `InitialLot` | 0.01 | Level-1 lot size; seeds the Fibonacci sequence. |
 | | `MaximumMartingaleLevels` | 6 | Hard cap on basket size (includes level 1). |
