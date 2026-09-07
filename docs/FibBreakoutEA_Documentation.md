@@ -159,6 +159,38 @@ same logic once at `OnInit()` for restart recovery (see §8).
   trade-off is losing the coordinated-close and profit-verification
   guarantees of virtual mode.
 
+### 5b. Profit lock (`EnableProfitLock`)
+
+Both TP modes evaluate against whatever tick they're given, on the tick
+they're given it. If price spikes far past `BasketTPDistance` and back down
+within a small number of ticks — a real fast-market gap, or (far more
+commonly in Strategy Tester) an artifact of synthetic/low-quality tick
+modeling for a historical bar — the basket can end up closing near the bare
+minimum TP instead of near the spike, simply because no tick at the spike
+was ever delivered while the basket was still open. This is not a defect in
+`CheckForBasketTP()` itself (it closes on the very first qualifying tick it
+receives, with no retracement-waiting logic anywhere) — it's a consequence
+of what tick data the basket was actually evaluated against. See §13 for
+how to check whether that's what's happening in your test.
+
+`CheckProfitLock()` adds an independent, always-on-top-of-either-TP-mode
+safeguard: it tracks the basket's peak floating profit
+(`CalculateBasketProfit()`) every tick. Once that peak clears
+`ProfitLockActivation`, the lock arms; from then on, if profit pulls back
+from the peak by `ProfitLockGivebackPercent`%, the basket closes
+immediately via `BeginBasketClose()` — capturing most of an unexpected
+favorable move instead of risking it all being given back. It never closes
+at a loss (guarded by `profit > 0`), and it's independent of
+`UseVirtualBasketTP` so it backstops broker-side TP mode too.
+
+Off by default (`EnableProfitLock=false`) so it doesn't change existing
+behavior. Set `ProfitLockActivation` at or above your typical
+`BasketTPDistance`-implied profit, so it only arms on genuinely unusual
+spikes rather than interfering with ordinary TP-sized wins — arming too low
+means it can force an exit slightly below your normal TP target in choppy
+conditions. The dashboard's "Profit Lock" line shows `OFF`, `watching
+(peak …)` before it arms, or `ARMED (peak …)` once armed.
+
 ## 6. Risk management (checked before every trade)
 
 `PassRiskChecksForAveraging()` and `CanStartNewCycle()` gate every new
@@ -253,6 +285,9 @@ averaging-blocked.
 | | `MinimumBasketProfit` | 0.00 | Minimum net profit required to actually close at TP. |
 | | `MinimumBasketProfitMode` | Currency | Currency / % of equity / price-distance only. |
 | | `UseVirtualBasketTP` | true | `true`: EA closes the whole basket together once real net profit (incl. swap/commission) meets `MinimumBasketProfit`. `false`: EA instead keeps a broker-side TP order on every position, synced to the current basket TP price — positions then close individually as the broker fills each TP, without the commission-aware profit check. See §5a. |
+| | `EnableProfitLock` | false | Enable the peak-profit giveback lock — closes the basket if profit pulls back too far from its peak. See §5b. |
+| | `ProfitLockActivation` | 1.00 | Floating basket profit (currency) that arms the lock. |
+| | `ProfitLockGivebackPercent` | 30.0 | % pullback from peak profit, once armed, that forces an immediate close. |
 | Averaging | `GridStep` | 0.50 | Distance between averaging levels. |
 | | `InitialLot` | 0.01 | Level-1 lot size; seeds the Fibonacci sequence. |
 | | `MaximumMartingaleLevels` | 6 | Hard cap on basket size (includes level 1). |
@@ -345,6 +380,20 @@ severe tail loss during a prolonged one-directional move. Instead, review:
 
 ## 13. Known limitations
 
+- **Strategy Tester tick quality directly affects TP accuracy.** `CheckForBasketTP()`
+  closes on the first tick that satisfies its condition — there is no
+  retracement-waiting logic. If a basket appears to spike well past
+  `BasketTPDistance` on the chart and then closes near the bare minimum
+  instead, that near-certainly means the spike was never delivered to
+  `OnTick()` as an actual simulated tick — it's a synthetic-modeling
+  artifact of the historical bar, not a decision the EA made. Check the
+  **Modelling quality %** in the tester's results tab (bottom of the report)
+  — well under 99% confirms coarse/synthetic tick reconstruction for that
+  run. Use "Every tick based on real ticks" and, if still affected, verify
+  your broker actually has genuine tick-level history for that symbol and
+  period (Tools → History Center). `EnableProfitLock` (§5b) mitigates the
+  impact regardless of the underlying cause, but cannot fix data that was
+  never generated at the true price.
 - **Netting accounts are not reconstructed from deal history.** The spec's
   preferred fallback (§ Important Account Type) — reconstructing
   per-level state from netting deal history — was intentionally not

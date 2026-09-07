@@ -94,6 +94,9 @@ input double   BasketTPDistance               = 0.50;          // Basket TP dist
 input double   MinimumBasketProfit            = 0.00;          // Minimum net profit required to close basket
 input ENUM_PROFIT_MODE MinimumBasketProfitMode = PROFIT_MODE_CURRENCY; // Minimum profit mode
 input bool     UseVirtualBasketTP             = true;          // Use EA-managed virtual basket TP
+input bool     EnableProfitLock               = false;         // Lock in profit if it gives back too much from its peak
+input double   ProfitLockActivation           = 1.00;          // Floating basket profit (currency) that arms the lock
+input double   ProfitLockGivebackPercent      = 30.0;          // % giveback from peak profit that forces an immediate close
 
 input group "AVERAGING"
 input double   GridStep                       = 0.50;          // Distance between averaging levels (price units)
@@ -173,6 +176,8 @@ bool    g_averagingBlocked    = false;
 bool    g_averagingHardBlocked= false;
 bool    g_marginProtectionTriggered = false;
 bool    g_maxLevelActionExecuted    = false;
+bool    g_profitLockArmed          = false;
+double  g_basketPeakProfit         = 0;
 bool    g_basketLossActionExecuted  = false;
 
 string  g_cycleId      = "NONE";
@@ -253,6 +258,7 @@ double CalculateBasketLots(ENUM_BASKET_DIRECTION direction);
 double GetLastEntryPrice(ENUM_BASKET_DIRECTION direction);
 void   RecalculateBasketMetrics(ENUM_BASKET_DIRECTION direction);
 void   CheckForBasketTP();
+void   CheckProfitLock();
 void   SyncBrokerSideTakeProfit(ENUM_BASKET_DIRECTION direction);
 double GetMinimumProfitThreshold();
 void   BeginBasketClose();
@@ -390,6 +396,9 @@ void OnTick()
 
          if(g_state == STATE_BUY_ACTIVE || g_state == STATE_SELL_ACTIVE)
             CheckMaximumBasketLoss();
+
+         if(g_state == STATE_BUY_ACTIVE || g_state == STATE_SELL_ACTIVE)
+            CheckProfitLock();
 
          if(g_state == STATE_BUY_ACTIVE || g_state == STATE_SELL_ACTIVE)
             CheckForBasketTP();
@@ -759,6 +768,8 @@ void ActivateBasket(ENUM_BASKET_DIRECTION direction, bool cancelOpposite)
    g_basketDirection = direction;
    RecalculateBasketMetrics(direction);
    SyncBrokerSideTakeProfit(direction);
+   g_profitLockArmed = false;
+   g_basketPeakProfit = 0;
    g_state = (direction == BASKET_BUY) ? STATE_BUY_ACTIVE : STATE_SELL_ACTIVE;
 
    if(cancelOpposite)
@@ -1286,6 +1297,40 @@ double GetMinimumProfitThreshold()
    return MinimumBasketProfit;
 }
 
+// Protects against a favorable spike that overshoots BasketTPDistance and
+// then gives most of it back before the ordinary TP check (or a broker-side
+// TP order) ever fires — most commonly seen against coarse/synthetic tester
+// tick data, but equally applicable to a real fast-market spike live. Tracks
+// the basket's peak floating profit; once that peak clears
+// ProfitLockActivation, a pullback of ProfitLockGivebackPercent% from the
+// peak forces an immediate close. Independent of UseVirtualBasketTP so it
+// backstops broker-side TP mode too. Never closes at a loss.
+void CheckProfitLock()
+{
+   if(!EnableProfitLock) return;
+   if(g_basketDirection == BASKET_NONE) return;
+
+   double profit = CalculateBasketProfit(g_basketDirection);
+   if(profit > g_basketPeakProfit)
+      g_basketPeakProfit = profit;
+
+   if(!g_profitLockArmed)
+   {
+      if(g_basketPeakProfit < ProfitLockActivation) return;
+      g_profitLockArmed = true;
+   }
+
+   double giveback = g_basketPeakProfit - profit;
+   double givebackLimit = g_basketPeakProfit * (ProfitLockGivebackPercent / 100.0);
+
+   if(profit > 0 && giveback >= givebackLimit)
+   {
+      WriteTradeLog("TP", StringFormat("Profit lock triggered. Peak=%.2f Current=%.2f Giveback=%.2f (limit %.2f).",
+                    g_basketPeakProfit, profit, giveback, givebackLimit));
+      BeginBasketClose();
+   }
+}
+
 void CheckForBasketTP()
 {
    if(!UseVirtualBasketTP) return;
@@ -1380,6 +1425,8 @@ void EnterCooldown()
    g_averagingHardBlocked = false;
    g_maxLevelActionExecuted = false;
    g_basketLossActionExecuted = false;
+   g_profitLockArmed = false;
+   g_basketPeakProfit = 0;
    g_weightedAverage = 0;
    g_basketTP = 0;
    g_lastEntryPrice = 0;
@@ -1843,6 +1890,7 @@ void UpdateDashboard()
    AddDashLine("--------------------------------");
    AddDashLine(StringFormat("Floating P/L: %.2f", floatingPL));
    AddDashLine(StringFormat("Basket P/L: %.2f", basketPL));
+   AddDashLine("Profit Lock: " + (!EnableProfitLock ? "OFF" : (g_profitLockArmed ? StringFormat("ARMED (peak %.2f)", g_basketPeakProfit) : StringFormat("watching (peak %.2f)", g_basketPeakProfit))));
    AddDashLine(StringFormat("Equity: %.2f", equity));
    AddDashLine(StringFormat("Balance: %.2f", balance));
    AddDashLine(StringFormat("Free Margin: %.2f", freeMargin));
