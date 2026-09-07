@@ -291,7 +291,7 @@ averaging-blocked.
 | Averaging | `GridStep` | 0.50 | Distance between averaging levels. |
 | | `InitialLot` | 0.01 | Level-1 lot size; seeds the Fibonacci sequence. |
 | | `MaximumMartingaleLevels` | 6 | Hard cap on basket size (includes level 1). |
-| | `MaximumBasketLots` | 0.25 | Hard cap on total basket volume. |
+| | `MaximumBasketLots` | 0.35 | Hard cap on total basket volume. |
 | | `MaximumLevelAction` | Stop averaging | Action once the level cap is hit. |
 | Risk | `EnableMaximumBasketLoss` | true | Enable the basket-loss cap. |
 | | `MaximumBasketLoss` | 100.0 | Basket loss (currency) that triggers `MaximumBasketLossAction`. |
@@ -338,8 +338,11 @@ above are safe optimization candidates in Strategy Tester.
 4. Recommended initial test defaults (already the EA's shipped defaults):
    `EntryDistance=0.50`, `GridStep=0.50`, `BasketTPDistance=0.50`,
    `InitialLot=0.01`, `MaximumMartingaleLevels=6`,
-   `MaximumBasketLots=0.25`, `MaximumBasketLoss=100`,
+   `MaximumBasketLots=0.35`, `MaximumBasketLoss=100`,
    `MaximumEquityDrawdownPercent=10`, `MaximumDailyLossPercent=5`.
+   `MaximumBasketLots` is sized so level 6 (cumulative 0.32 lots) is
+   actually reachable — it used to be 0.25, which silently capped the
+   basket at level 5 regardless of `MaximumMartingaleLevels`.
 5. Test across the scenarios in spec §48: trending bull/bear, sideways,
    high/low volatility, high spread, gap-heavy periods (weekend
    opens/news), and deliberately small `MaximumMartingaleLevels`/

@@ -102,7 +102,7 @@ input group "AVERAGING"
 input double   GridStep                       = 0.50;          // Distance between averaging levels (price units)
 input double   InitialLot                     = 0.01;          // Initial (level 1) lot size
 input int      MaximumMartingaleLevels        = 6;             // Maximum number of levels (includes initial)
-input double   MaximumBasketLots              = 0.25;          // Maximum total basket lots allowed
+input double   MaximumBasketLots              = 0.35;          // Maximum total basket lots allowed
 input ENUM_MAX_LEVEL_ACTION MaximumLevelAction = MAXLEVEL_STOP_AVERAGING; // Action at maximum level
 
 input group "RISK"
