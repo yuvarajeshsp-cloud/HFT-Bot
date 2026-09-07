@@ -105,6 +105,15 @@ input int      MaximumMartingaleLevels        = 6;             // Maximum number
 input double   MaximumBasketLots              = 0.35;          // Maximum total basket lots allowed
 input ENUM_MAX_LEVEL_ACTION MaximumLevelAction = MAXLEVEL_STOP_AVERAGING; // Action at maximum level
 
+input group "ADAPTIVE GRID"
+input bool     UseATRGrid                     = false;         // Size Entry/Grid/TP distances from ATR instead of fixed inputs
+input ENUM_TIMEFRAMES ATRGridTimeframe        = PERIOD_H1;      // Timeframe the sizing ATR is measured on
+input int      ATRGridPeriod                  = 14;             // ATR period for grid sizing
+input double   ATRGridEntryMultiplier         = 1.0;            // EntryDistance = ATR * this multiplier
+input double   ATRGridStepMultiplier          = 1.0;            // GridStep = ATR * this multiplier
+input double   ATRGridTPMultiplier            = 1.0;            // BasketTPDistance = ATR * this multiplier
+input double   ATRGridMinDistance             = 0.10;           // Floor applied to every ATR-derived distance
+
 input group "RISK"
 input bool     EnableMaximumBasketLoss        = true;          // Enable maximum basket loss protection
 input double   MaximumBasketLoss              = 100.0;         // Maximum basket loss (account currency)
@@ -197,6 +206,10 @@ bool    g_eaDisabled            = false;
 bool    g_tradeLock = false;
 
 int     g_atrHandle     = INVALID_HANDLE;
+int     g_atrGridHandle = INVALID_HANDLE;
+double  g_effEntryDistance    = 0;
+double  g_effGridStep         = 0;
+double  g_effBasketTPDistance = 0;
 int     g_emaFastHandle = INVALID_HANDLE;
 int     g_emaSlowHandle = INVALID_HANDLE;
 
@@ -233,6 +246,7 @@ void   ActivateBasket(ENUM_BASKET_DIRECTION direction, bool cancelOpposite);
 void   HandleEmergencyBothSides();
 bool   StartNewCycle();
 bool   CanStartNewCycle();
+void   UpdateEffectiveGridDistances();
 bool   ValidateStopDistances(double &buyPrice, double &sellPrice, double ask, double bid);
 void   GetTrendPermissions(bool &allowBuy, bool &allowSell);
 bool   PlaceInitialPendingOrders(double buyPrice, double sellPrice, bool placeBuy, bool placeSell);
@@ -325,6 +339,14 @@ int OnInit()
       g_emaSlowHandle = iMA(g_symbol, PERIOD_CURRENT, TrendEMASlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
    }
 
+   if(UseATRGrid)
+      g_atrGridHandle = iATR(g_symbol, ATRGridTimeframe, ATRGridPeriod);
+
+   // Seed effective grid distances before any restart-recovered basket
+   // calls RecalculateBasketMetrics() below, so it never computes against
+   // an uninitialized (zero) distance.
+   UpdateEffectiveGridDistances();
+
    bool envOk = ValidateEnvironment();
 
    if(!envOk)
@@ -353,6 +375,7 @@ void OnDeinit(const int reason)
    EventKillTimer();
    RemoveDashboard();
    if(g_atrHandle != INVALID_HANDLE)     IndicatorRelease(g_atrHandle);
+   if(g_atrGridHandle != INVALID_HANDLE) IndicatorRelease(g_atrGridHandle);
    if(g_emaFastHandle != INVALID_HANDLE) IndicatorRelease(g_emaFastHandle);
    if(g_emaSlowHandle != INVALID_HANDLE) IndicatorRelease(g_emaSlowHandle);
 }
@@ -840,6 +863,51 @@ bool CanStartNewCycle()
    return true;
 }
 
+// Snapshots EntryDistance/GridStep/BasketTPDistance for the cycle about to
+// start. With UseATRGrid=false these are simply the fixed inputs (default,
+// unchanged behavior). With UseATRGrid=true they are recomputed from the
+// current ATR reading instead — sized to whatever the instrument is
+// actually doing rather than a static guess. Snapshotting once per cycle
+// (not recalculating mid-basket) keeps a basket's own grid spacing
+// internally consistent for its whole lifetime; only a brand-new cycle
+// picks up a new ATR reading. Also called once at OnInit() so a basket
+// recovered on restart (see RebuildStateFromBroker) has valid distances
+// before RecalculateBasketMetrics() first runs.
+void UpdateEffectiveGridDistances()
+{
+   if(!UseATRGrid)
+   {
+      g_effEntryDistance    = EntryDistance;
+      g_effGridStep         = GridStep;
+      g_effBasketTPDistance = BasketTPDistance;
+      return;
+   }
+
+   double atr = 0;
+   if(g_atrGridHandle != INVALID_HANDLE)
+   {
+      double buf[1];
+      if(CopyBuffer(g_atrGridHandle, 0, 0, 1, buf) > 0)
+         atr = buf[0];
+   }
+
+   if(atr <= 0)
+   {
+      g_effEntryDistance    = EntryDistance;
+      g_effGridStep         = GridStep;
+      g_effBasketTPDistance = BasketTPDistance;
+      WriteTradeLog("CYCLE", "ATR grid sizing unavailable (ATR<=0, likely insufficient history) - using fixed distance inputs instead.");
+      return;
+   }
+
+   g_effEntryDistance    = MathMax(atr * ATRGridEntryMultiplier, ATRGridMinDistance);
+   g_effGridStep         = MathMax(atr * ATRGridStepMultiplier,  ATRGridMinDistance);
+   g_effBasketTPDistance = MathMax(atr * ATRGridTPMultiplier,    ATRGridMinDistance);
+
+   WriteTradeLog("CYCLE", StringFormat("ATR grid sizing: ATR=%s Entry=%s Grid=%s TP=%s",
+                 PxStr(atr), PxStr(g_effEntryDistance), PxStr(g_effGridStep), PxStr(g_effBasketTPDistance)));
+}
+
 bool StartNewCycle()
 {
    if(!CanStartNewCycle())
@@ -850,8 +918,10 @@ bool StartNewCycle()
    if(ask <= 0 || bid <= 0)
       return false;
 
-   double buyStopPrice  = NormalizePriceToTick(ask + EntryDistance);
-   double sellStopPrice = NormalizePriceToTick(bid - EntryDistance);
+   UpdateEffectiveGridDistances();
+
+   double buyStopPrice  = NormalizePriceToTick(ask + g_effEntryDistance);
+   double sellStopPrice = NormalizePriceToTick(bid - g_effEntryDistance);
 
    if(!ValidateStopDistances(buyStopPrice, sellStopPrice, ask, bid))
       return false;
@@ -1272,13 +1342,13 @@ void RecalculateBasketMetrics(ENUM_BASKET_DIRECTION direction)
    g_weightedAverage = CalculateWeightedAverage(direction);
 
    g_basketTP = (direction == BASKET_BUY) ?
-                NormalizePriceToTick(g_weightedAverage + BasketTPDistance) :
-                NormalizePriceToTick(g_weightedAverage - BasketTPDistance);
+                NormalizePriceToTick(g_weightedAverage + g_effBasketTPDistance) :
+                NormalizePriceToTick(g_weightedAverage - g_effBasketTPDistance);
 
    g_lastEntryPrice = GetLastEntryPrice(direction);
    g_nextAveragingPrice = (direction == BASKET_BUY) ?
-                           NormalizePriceToTick(g_lastEntryPrice - GridStep) :
-                           NormalizePriceToTick(g_lastEntryPrice + GridStep);
+                           NormalizePriceToTick(g_lastEntryPrice - g_effGridStep) :
+                           NormalizePriceToTick(g_lastEntryPrice + g_effGridStep);
 
    g_maxLevelReached = (g_currentLevel >= MaximumMartingaleLevels);
 }
@@ -1886,6 +1956,9 @@ void UpdateDashboard()
    AddDashLine("Weighted Average: " + PxStr(g_weightedAverage));
    AddDashLine("Basket TP: " + PxStr(g_basketTP));
    AddDashLine("Next Averaging Price: " + PxStr(g_nextAveragingPrice));
+   AddDashLine("Grid Mode: " + (UseATRGrid ?
+               StringFormat("ATR (Entry=%s Grid=%s TP=%s)", PxStr(g_effEntryDistance), PxStr(g_effGridStep), PxStr(g_effBasketTPDistance)) :
+               "Fixed"));
    AddDashLine(StringFormat("Next Fibonacci Lot: %.2f", nextLot));
    AddDashLine("--------------------------------");
    AddDashLine(StringFormat("Floating P/L: %.2f", floatingPL));

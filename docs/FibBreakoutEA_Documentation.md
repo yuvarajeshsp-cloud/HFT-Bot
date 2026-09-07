@@ -63,6 +63,41 @@ requested distance against `SYMBOL_TRADE_STOPS_LEVEL` and
 auto-adjusted (`AutoAdjustInvalidStopDistance = true`, default) or the cycle
 is rejected with a logged reason.
 
+### 3a. Adaptive (ATR-sized) grid — `UseATRGrid`
+
+By default (`UseATRGrid = false`) `EntryDistance`, `GridStep`, and
+`BasketTPDistance` are exactly the fixed inputs above, unchanged from
+earlier versions. With `UseATRGrid = true`, `UpdateEffectiveGridDistances()`
+instead computes them from the current ATR (`ATRGridTimeframe`,
+`ATRGridPeriod` — a separate, independent ATR reading from the one used by
+`EnableATRFilter`) each time a new cycle starts:
+
+```
+g_effEntryDistance    = max(ATR * ATRGridEntryMultiplier, ATRGridMinDistance)
+g_effGridStep         = max(ATR * ATRGridStepMultiplier,  ATRGridMinDistance)
+g_effBasketTPDistance = max(ATR * ATRGridTPMultiplier,    ATRGridMinDistance)
+```
+
+These effective values are snapshotted once at cycle start and used for
+that basket's entire lifetime — a basket's own grid spacing never shifts
+mid-cycle just because ATR moved; only the *next* cycle picks up a new
+reading. This is what `RecalculateBasketMetrics()`, `CheckForAveraging()`,
+and the initial pending-order placement actually use internally; the raw
+inputs `EntryDistance`/`GridStep`/`BasketTPDistance` are only read directly
+by `UpdateEffectiveGridDistances()` itself (as the fixed-mode values, and
+as the fallback if ATR is unavailable — e.g. insufficient history early in
+a test) and by the input-sanity check in `ValidateEnvironment()`.
+
+`UpdateEffectiveGridDistances()` also runs once at `OnInit()`, before
+`RebuildStateFromBroker()`, so a basket recovered after a restart has valid
+distances immediately. Note this means a restart under `UseATRGrid=true`
+re-derives that basket's grid spacing from ATR *at restart time*, not
+necessarily identical to the reading the basket actually started with —
+the same category of restart caveat as the equity-drawdown baseline (§13).
+
+The dashboard's "Grid Mode" line shows `Fixed` or `ATR (Entry=… Grid=… TP=…)`
+with the live effective values.
+
 ## 4. State machine
 
 ```
@@ -293,6 +328,13 @@ averaging-blocked.
 | | `MaximumMartingaleLevels` | 6 | Hard cap on basket size (includes level 1). |
 | | `MaximumBasketLots` | 0.35 | Hard cap on total basket volume. |
 | | `MaximumLevelAction` | Stop averaging | Action once the level cap is hit. |
+| Adaptive Grid | `UseATRGrid` | false | Size Entry/Grid/TP distances from ATR each cycle instead of the fixed inputs above. See §3a. |
+| | `ATRGridTimeframe` | H1 | Timeframe the sizing ATR is measured on. |
+| | `ATRGridPeriod` | 14 | ATR period for grid sizing. |
+| | `ATRGridEntryMultiplier` | 1.0 | `EntryDistance = ATR × this`. |
+| | `ATRGridStepMultiplier` | 1.0 | `GridStep = ATR × this`. |
+| | `ATRGridTPMultiplier` | 1.0 | `BasketTPDistance = ATR × this`. |
+| | `ATRGridMinDistance` | 0.10 | Floor applied to every ATR-derived distance, so a near-zero ATR reading can't collapse the grid. |
 | Risk | `EnableMaximumBasketLoss` | true | Enable the basket-loss cap. |
 | | `MaximumBasketLoss` | 100.0 | Basket loss (currency) that triggers `MaximumBasketLossAction`. |
 | | `MaximumBasketLossAction` | Close basket | Action at max basket loss. |
