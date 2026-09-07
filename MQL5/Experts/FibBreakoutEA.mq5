@@ -3,7 +3,7 @@
 //|         MT5 XAUUSD Fibonacci Breakout + Averaging Expert Advisor |
 //+------------------------------------------------------------------+
 #property copyright "FibBreakoutEA"
-#property version   "1.00"
+#property version   "1.01"
 #property strict
 #property description "Breakout (BUY STOP / SELL STOP) entry with Fibonacci-lot averaging,"
 #property description "virtual weighted-average basket take-profit, and layered risk controls."
