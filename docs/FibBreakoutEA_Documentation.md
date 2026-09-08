@@ -296,6 +296,31 @@ the cycle counter across terminal restarts, but broker
 positions/orders remain the primary source of truth for everything else
 (level, average, TP, direction).
 
+### 8a. Market-close guard (always on, no input)
+
+Separate from the user-configurable `EnableTradingHours`/`CloseBasketAtSessionEnd`
+window, `IsNearMarketClose()` is an always-active safety net with no input to
+turn it off: it reads the symbol's *actual* broker-defined trading-session
+schedule via `SymbolInfoSessionTrade()` and, once "now" is within
+`MARKET_CLOSE_SAFETY_MINUTES` (a `#define`, default 10 minutes — not an
+input, since the correct close time is broker/server data, not something to
+hand-configure) of today's real session close:
+
+- an open basket is force-closed (`BeginBasketClose()`), same code path as a
+  normal TP close;
+- pending breakout orders are cancelled and the EA drops into cooldown
+  rather than risk carrying a stop order across the close;
+- `CanStartNewCycle()` refuses to start a fresh cycle.
+
+This is what catches the daily close and the Friday close ahead of the
+weekend gap alike — both are just "today's session end" from the broker's
+point of view, so the same mechanism handles both without special-casing
+the day of week. If the broker or test data doesn't expose session times
+(`SymbolInfoSessionTrade` returns false), this safely does nothing rather
+than guessing a close time — the dashboard's "Market Close Guard" line will
+simply stay `OK` throughout in that case, which is worth noticing if you
+were expecting it to engage.
+
 ## 9. Dashboard
 
 An on-chart label panel (`OBJ_LABEL` objects, top-left) refreshes every
@@ -352,7 +377,7 @@ averaging-blocked.
 | | `TrendEMAFastPeriod` / `TrendEMASlowPeriod` | 20 / 50 | EMA periods; fast>slow allows BUY-only, fast<slow allows SELL-only. |
 | Trading Hours | `EnableTradingHours` | false | Restrict new entries/averaging to a time window. |
 | | `TradingStartTime` / `TradingEndTime` | 00:00 / 23:59 | Server-time HH:MM window (overnight wrap supported). |
-| | `CloseBasketAtSessionEnd` | false | Force-close an active basket when the window ends. |
+| | `CloseBasketAtSessionEnd` | false | Force-close an active basket when the window ends. Separate from, and in addition to, the always-on market-close guard — see §8a. |
 | Orders | `EnablePendingExpiration` | true | Cancel untriggered pendings after a timeout. |
 | | `PendingExpirationMinutes` | 60 | Timeout in minutes. |
 | | `AutoAdjustInvalidStopDistance` | true | Auto-widen distances that violate broker stop/freeze levels. |

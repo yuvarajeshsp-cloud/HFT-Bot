@@ -3,7 +3,7 @@
 //|         MT5 XAUUSD Fibonacci Breakout + Averaging Expert Advisor |
 //+------------------------------------------------------------------+
 #property copyright "FibBreakoutEA"
-#property version   "1.01"
+#property version   "1.02"
 #property strict
 #property description "Breakout (BUY STOP / SELL STOP) entry with Fibonacci-lot averaging,"
 #property description "virtual weighted-average basket take-profit, and layered risk controls."
@@ -229,6 +229,12 @@ uint    g_lastDashboardUpdate = 0;
 #define DASH_FONT_SIZE   8
 #define DASH_FONT        "Consolas"
 
+// Not an input by design: the broker's real session close time is read
+// directly from the symbol's own trading-session schedule (SymbolInfoSessionTrade),
+// which varies by broker/server and shouldn't be hand-configured. This is
+// just how many minutes of safety margin to close ahead of that real close.
+#define MARKET_CLOSE_SAFETY_MINUTES 10
+
 //======================================================================
 // FORWARD DECLARATIONS (grouped by category, implemented below)
 //======================================================================
@@ -289,6 +295,7 @@ double NormalizePriceToTick(double price);
 string PxStr(double price);
 bool   IsSpreadAcceptable();
 bool   IsWithinTradingHours();
+bool   IsNearMarketClose();
 int    ParseTimeToMinutes(string t);
 bool   IsVolatilityAcceptable();
 bool   IsMarginSafe(double volume, ENUM_ORDER_TYPE orderType);
@@ -407,12 +414,25 @@ void OnTick()
 
       case STATE_WAITING_FOR_BREAKOUT:
          CheckPendingExpiration();
+         if(g_state == STATE_WAITING_FOR_BREAKOUT && IsNearMarketClose())
+         {
+            WriteTradeLog("CYCLE", "Market close approaching. Cancelling pending breakout orders.");
+            CancelAllPendingOrders();
+            g_state = STATE_COOLDOWN;
+            g_cooldownStart = TimeCurrent();
+         }
          break;
 
       case STATE_BUY_ACTIVE:
       case STATE_SELL_ACTIVE:
          RecalculateBasketMetrics(g_basketDirection);
          SyncBrokerSideTakeProfit(g_basketDirection);
+
+         if(IsNearMarketClose())
+         {
+            WriteTradeLog("CLOSE", "Market close approaching. Closing open basket.");
+            BeginBasketClose();
+         }
 
          if(EnableTradingHours && CloseBasketAtSessionEnd && !IsWithinTradingHours())
             BeginBasketClose();
@@ -858,6 +878,7 @@ bool CanStartNewCycle()
    if(!IsTradingAllowed())                            return false;
    if(EnableSpreadFilter && !IsSpreadAcceptable())     return false;
    if(EnableTradingHours && !IsWithinTradingHours())   return false;
+   if(IsNearMarketClose())                             return false;
    if(EnableATRFilter && !IsVolatilityAcceptable())    return false;
    if(!IsMarginSafe(NormalizeVolume(InitialLot), ORDER_TYPE_BUY)) return false;
    return true;
@@ -1731,6 +1752,39 @@ bool IsWithinTradingHours()
       return (nowMin >= startMin || nowMin <= endMin);
 }
 
+// Always-on safety net, independent of EnableTradingHours/CloseBasketAtSessionEnd
+// (which are the user-configurable window): reads the broker's own trading-session
+// schedule for the symbol and reports true once "now" is within
+// MARKET_CLOSE_SAFETY_MINUTES of today's real session close - e.g. the daily
+// close, or the Friday close ahead of the weekend gap. No input is exposed for
+// this because the correct close time is broker/server-specific data, not
+// something to hand-configure; if the broker/test data doesn't expose session
+// times, this safely reports false rather than guessing.
+bool IsNearMarketClose()
+{
+   MqlDateTime dtNow;
+   TimeToStruct(TimeCurrent(), dtNow);
+   int secondsNow = dtNow.hour * 3600 + dtNow.min * 60 + dtNow.sec;
+
+   for(uint session = 0; session < 5; session++)
+   {
+      datetime sessFrom = 0, sessTo = 0;
+      if(!SymbolInfoSessionTrade(g_symbol, (ENUM_DAY_OF_WEEK)dtNow.day_of_week, session, sessFrom, sessTo))
+         break;
+
+      MqlDateTime dtFrom, dtTo;
+      TimeToStruct(sessFrom, dtFrom);
+      TimeToStruct(sessTo, dtTo);
+      int secFrom = dtFrom.hour * 3600 + dtFrom.min * 60 + dtFrom.sec;
+      int secTo   = dtTo.hour   * 3600 + dtTo.min   * 60 + dtTo.sec;
+
+      if(secondsNow >= secFrom && secondsNow <= secTo)
+         return (secTo - secondsNow) <= MARKET_CLOSE_SAFETY_MINUTES * 60;
+   }
+
+   return false; // not inside any known session right now - nothing to guard against
+}
+
 bool IsVolatilityAcceptable()
 {
    if(!EnableATRFilter) return true;
@@ -1978,6 +2032,7 @@ void UpdateDashboard()
                                   (g_dailyLossTriggered ? "DAILY LOSS STOP" :
                                   (g_equityDrawdownTriggered ? "EQUITY DD STOP" : "OK"))));
    AddDashLine("Trading Hours: " + (EnableTradingHours ? (IsWithinTradingHours() ? "OPEN" : "CLOSED") : "N/A"));
+   AddDashLine("Market Close Guard: " + (IsNearMarketClose() ? "CLOSING SOON" : "OK"));
    AddDashLine("ATR Status: " + (EnableATRFilter ? (IsVolatilityAcceptable() ? "OK" : "BLOCKED") : "N/A"));
    AddDashLine("Averaging Blocked: " + (g_averagingHardBlocked ? "YES (hard)" : (g_averagingBlocked ? "YES" : "NO")));
 
