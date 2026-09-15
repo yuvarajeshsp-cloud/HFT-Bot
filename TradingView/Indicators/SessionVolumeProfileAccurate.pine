@@ -1,0 +1,161 @@
+//@version=6
+indicator("Session Volume Profile (Accurate)", shorttitle="SVP Accurate", overlay=true, max_boxes_count=200, max_lines_count=50, max_labels_count=50)
+
+// ---------------- Inputs ----------------
+grpSession = "Session"
+useCustomSess = input.bool(true, "Use Custom Session (off = reset daily)", group=grpSession)
+sessionInput  = input.session("0000-2359", "Session Time", group=grpSession)
+sessionTZ     = input.string("Exchange", "Session Timezone", group=grpSession)
+
+grpProfile = "Profile"
+numRows      = input.int(50, "Number of Rows", minval=10, maxval=150, group=grpProfile)
+valueAreaPct = input.float(70.0, "Value Area %", minval=1.0, maxval=99.0, step=1.0, group=grpProfile)
+profileWidth = input.int(30, "Profile Width (bars)", minval=5, maxval=150, group=grpProfile)
+profilePos   = input.string("Right", "Profile Position", options=["Right", "Left"], group=grpProfile)
+showDeveloping = input.bool(true, "Show Developing (Live) Profile", group=grpProfile)
+
+grpAccuracy = "Accuracy"
+// 1min is a good accuracy/performance tradeoff for full sessions; sub-minute
+// lower timeframes are more accurate but can hit Pine's calc-time limit on
+// long sessions or low chart timeframes.
+lowerTF = input.timeframe("1", "Lower Timeframe for Volume Backfill", group=grpAccuracy)
+
+grpStyle = "Style"
+colProfile = input.color(color.new(color.blue, 75), "Profile Color", group=grpStyle)
+colVA      = input.color(color.new(color.blue, 55), "Value Area Color", group=grpStyle)
+colPOC     = input.color(color.orange, "POC Color", group=grpStyle)
+colVAH     = input.color(color.red, "VAH Color", group=grpStyle)
+colVAL     = input.color(color.green, "VAL Color", group=grpStyle)
+showLabels = input.bool(true, "Show POC/VAH/VAL Labels", group=grpStyle)
+
+// ---------------- Session detection ----------------
+t = useCustomSess ? time(timeframe.period, sessionInput, sessionTZ) : time("D")
+newSession = na(t[1]) or t != t[1]
+
+// ---------------- Persistent state ----------------
+var float[] tPrices = array.new_float(0)
+var float[] tVols   = array.new_float(0)
+var float sessHigh = na
+var float sessLow  = na
+var int sessStartBar = na
+
+var box[] profileBoxes = array.new_box(0)
+var line pocLine = na
+var line vahLine = na
+var line valLine = na
+var label pocLabel = na
+var label vahLabel = na
+var label valLabel = na
+
+if newSession
+    array.clear(tPrices)
+    array.clear(tVols)
+    sessHigh := high
+    sessLow := low
+    sessStartBar := bar_index
+    // Detach (don't delete) the finished session's drawings so they stay on
+    // the chart as history instead of being wiped by the next redraw.
+    profileBoxes := array.new_box(0)
+    pocLine := na
+    vahLine := na
+    valLine := na
+    pocLabel := na
+    vahLabel := na
+    valLabel := na
+else
+    sessHigh := math.max(sessHigh, high)
+    sessLow := math.min(sessLow, low)
+
+// request.* calls must run unconditionally every bar
+[ltfClose, ltfVol] = request.security_lower_tf(syminfo.tickerid, lowerTF, [close, volume])
+
+// Commit each bar's intrabar trades exactly once, when it closes, to avoid
+// double-counting on realtime recalculation of the still-forming bar.
+if barstate.isconfirmed and not na(ltfClose)
+    for i = 0 to array.size(ltfClose) - 1
+        array.push(tPrices, array.get(ltfClose, i))
+        array.push(tVols, array.get(ltfVol, i))
+
+// ---------------- Bucketing ----------------
+f_computeLevels(pricesArr, volsArr, lo, hi, rows) =>
+    float[] out = array.new_float(rows, 0.0)
+    rng = hi - lo
+    if rng > 0 and array.size(pricesArr) > 0
+        step = rng / rows
+        for i = 0 to array.size(pricesArr) - 1
+            p = array.get(pricesArr, i)
+            if p >= lo and p <= hi
+                idx = int(math.min(rows - 1, math.max(0, math.floor((p - lo) / step))))
+                array.set(out, idx, array.get(out, idx) + array.get(volsArr, i))
+    out
+
+f_valueArea(levels, rows, pctTarget) =>
+    totalVol = array.sum(levels)
+    pocIdx = array.indexof(levels, array.max(levels))
+    loIdx = pocIdx
+    hiIdx = pocIdx
+    vaVol = array.get(levels, pocIdx)
+    targetVol = totalVol * pctTarget / 100.0
+    while vaVol < targetVol and (loIdx > 0 or hiIdx < rows - 1)
+        belowVol = loIdx > 0 ? array.get(levels, loIdx - 1) : -1.0
+        aboveVol = hiIdx < rows - 1 ? array.get(levels, hiIdx + 1) : -1.0
+        if aboveVol >= belowVol
+            hiIdx += 1
+            vaVol += aboveVol
+        else
+            loIdx -= 1
+            vaVol += belowVol
+    [pocIdx, loIdx, hiIdx]
+
+// ---------------- Draw ----------------
+// showDeveloping=false throttles redraws to every 5 bars (still redraws on
+// the first bar of a session) instead of every bar, to save resources.
+doDraw = showDeveloping or newSession or bar_index % 5 == 0
+if doDraw and not na(sessLow) and sessHigh > sessLow and array.size(tPrices) > 0
+    levels = f_computeLevels(tPrices, tVols, sessLow, sessHigh, numRows)
+    maxVol = array.max(levels)
+
+    if maxVol > 0
+        [pocIdx, loIdx, hiIdx] = f_valueArea(levels, numRows, valueAreaPct)
+        step = (sessHigh - sessLow) / numRows
+
+        for i = 0 to array.size(profileBoxes) - 1
+            box.delete(array.get(profileBoxes, i))
+        array.clear(profileBoxes)
+
+        baseX = profilePos == "Right" ? bar_index + 1 : sessStartBar
+        dir = profilePos == "Right" ? 1 : -1
+
+        for row = 0 to numRows - 1
+            vol = array.get(levels, row)
+            if vol > 0
+                barsW = math.max(1, int(vol / maxVol * profileWidth))
+                xA = baseX
+                xB = baseX + dir * barsW
+                rowLo = sessLow + row * step
+                rowHi = rowLo + step
+                inVA = row >= loIdx and row <= hiIdx
+                b = box.new(left=math.min(xA, xB), right=math.max(xA, xB), top=rowHi, bottom=rowLo, border_width=0, bgcolor=inVA ? colVA : colProfile)
+                array.push(profileBoxes, b)
+
+        pocPrice = sessLow + (pocIdx + 0.5) * step
+        vahPrice = sessLow + (hiIdx + 1) * step
+        valPrice = sessLow + loIdx * step
+
+        lineX1 = sessStartBar
+        lineX2 = profilePos == "Right" ? bar_index + 1 + profileWidth : sessStartBar - profileWidth
+
+        line.delete(pocLine)
+        line.delete(vahLine)
+        line.delete(valLine)
+        pocLine := line.new(lineX1, pocPrice, lineX2, pocPrice, color=colPOC, width=2)
+        vahLine := line.new(lineX1, vahPrice, lineX2, vahPrice, color=colVAH, style=line.style_dashed)
+        valLine := line.new(lineX1, valPrice, lineX2, valPrice, color=colVAL, style=line.style_dashed)
+
+        if showLabels
+            label.delete(pocLabel)
+            label.delete(vahLabel)
+            label.delete(valLabel)
+            pocLabel := label.new(lineX2, pocPrice, "POC " + str.tostring(pocPrice, format.mintick), color=color.new(color.white, 100), textcolor=colPOC, style=label.style_label_left, size=size.small)
+            vahLabel := label.new(lineX2, vahPrice, "VAH " + str.tostring(vahPrice, format.mintick), color=color.new(color.white, 100), textcolor=colVAH, style=label.style_label_left, size=size.small)
+            valLabel := label.new(lineX2, valPrice, "VAL " + str.tostring(valPrice, format.mintick), color=color.new(color.white, 100), textcolor=colVAL, style=label.style_label_left, size=size.small)
