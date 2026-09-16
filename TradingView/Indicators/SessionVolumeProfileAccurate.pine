@@ -74,7 +74,7 @@ else
 
 // Commit each bar's intrabar trades exactly once, when it closes, to avoid
 // double-counting on realtime recalculation of the still-forming bar.
-if barstate.isconfirmed and not na(ltfClose)
+if barstate.isconfirmed and not na(ltfClose) and array.size(ltfClose) > 0
     for i = 0 to array.size(ltfClose) - 1
         array.push(tPrices, array.get(ltfClose, i))
         array.push(tVols, array.get(ltfVol, i))
@@ -122,9 +122,10 @@ if doDraw and not na(sessLow) and sessHigh > sessLow and array.size(tPrices) > 0
         [pocIdx, loIdx, hiIdx] = f_valueArea(levels, numRows, valueAreaPct)
         step = (sessHigh - sessLow) / numRows
 
-        for i = 0 to array.size(profileBoxes) - 1
-            box.delete(array.get(profileBoxes, i))
-        array.clear(profileBoxes)
+        if array.size(profileBoxes) > 0
+            for i = 0 to array.size(profileBoxes) - 1
+                box.delete(array.get(profileBoxes, i))
+            array.clear(profileBoxes)
 
         baseX = profilePos == "Right" ? bar_index + 1 : sessStartBar
         dir = profilePos == "Right" ? 1 : -1
