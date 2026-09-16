@@ -29,7 +29,10 @@ colVAL     = input.color(color.green, "VAL Color", group=grpStyle)
 showLabels = input.bool(true, "Show POC/VAH/VAL Labels", group=grpStyle)
 
 // ---------------- Session detection ----------------
-t = useCustomSess ? time(timeframe.period, sessionInput, sessionTZ) : time("D")
+// time() needs a real IANA/UTC offset string, not the literal "Exchange" —
+// resolve that sentinel to the symbol's actual exchange timezone.
+resolvedTZ = sessionTZ == "Exchange" ? syminfo.timezone : sessionTZ
+t = useCustomSess ? time(timeframe.period, sessionInput, resolvedTZ) : time("D")
 newSession = na(t[1]) or t != t[1]
 
 // ---------------- Persistent state ----------------
