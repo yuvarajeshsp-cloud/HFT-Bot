@@ -323,14 +323,75 @@ were expecting it to engage.
 
 ## 9. Dashboard
 
-An on-chart label panel (`OBJ_LABEL` objects, top-left) refreshes every
-tick (throttled to ~5/sec) and every second via `OnTimer()`, showing:
-symbol, account type (with a hedging-mismatch warning), EA state, bid/ask/
-spread, cycle ID, direction, level/max level, position count, total lots,
-weighted average, basket TP, next averaging price, next Fibonacci lot,
-floating/basket P/L, equity/balance/free margin/margin level, daily P/L,
-drawdown %, and status flags for spread/margin/risk/trading-hours/ATR/
-averaging-blocked.
+An on-chart panel (a background `OBJ_RECTANGLE_LABEL` plus `OBJ_LABEL`
+rows, top-left) refreshes every tick (throttled to ~5/sec) and every second
+via `OnTimer()`, showing: symbol, account type (with a hedging-mismatch
+warning), EA state and manual-pause flag, bid/ask/spread/leverage, cycle
+ID, direction, level/max level, position count, total lots, weighted
+average, basket TP, next averaging price, grid mode, next Fibonacci lot,
+floating/basket P/L, the basket's best/worst floating P/L this cycle,
+profit-lock state, equity/balance/free margin/margin level, daily P/L,
+drawdown %, the closed-P/L table (§9a), and status flags for spread /
+margin / risk / trading-hours / market-close guard / ATR / averaging-blocked.
+Rows carrying a number are colour-coded green/red by sign.
+
+### 9a. Closed-P/L table
+
+`UpdateHistoryStats()` walks the deal history **once** and fills every
+bucket in a single pass: today plus the previous four trading days, then
+week / month / year / all-time, with net profit (profit + swap +
+commission) and traded volume for each. Only deals matching this EA's
+`Symbol() + MagicNumber` and representing an *exit*
+(`DEAL_ENTRY_OUT`/`OUT_BY`/`INOUT`) are counted, so the table reports this
+EA's realised results, not the account's.
+
+It is rebuilt only when the deal count actually changes or every
+`HISTORY_REFRESH_SECONDS` (a `#define`, 5s), never per tick — a full
+history rescan on every tick would be crippling on an account with a long
+history.
+
+Day buckets skip Saturday/Sunday as *labels*, but no deal is lost: each
+bucket runs from its own start up to the next newer bucket's start, so
+weekend and Sunday-evening deals fold into the preceding Friday row.
+
+### 9b. Chart level lines
+
+While a basket is open, `DrawBasketLevels()` puts the three numbers that
+actually matter on the price axis rather than only in the panel:
+
+| Line | Colour / style | Meaning |
+|---|---|---|
+| Basket average | goldenrod, solid | current weighted-average entry |
+| Basket TP | green, dashed | where `CheckForBasketTP()` will close |
+| Next averaging level | red, dotted | where `CheckForAveraging()` will add |
+
+They are removed automatically when the basket closes.
+
+### 9c. Manual control buttons
+
+Four buttons in the bottom-right corner, handled by `OnChartEvent()`.
+Every one of them routes through the same functions the automated logic
+uses, so a manual intervention leaves the state machine consistent instead
+of bypassing it:
+
+| Button | Action |
+|---|---|
+| **Pause EA** / **Resume EA** | Toggles `g_userPaused`, which gates `CanStartNewCycle()`. An already-open basket keeps being managed — TP, risk limits and the market-close guard all stay live. |
+| **Cancel Pending** | `CancelAllPendingOrders()`; if it was waiting for a breakout, drops to cooldown. |
+| **Close Basket** | `BeginBasketClose()` — the same graceful close path a TP hit uses. |
+| **Flatten + Pause** | Cancels pendings, closes every EA position, then pauses. The "get me out now" button. |
+
+Clicks are ignored (with a log line) while a trade operation is already in
+progress, and the buttons never latch.
+
+### 9d. Tester behaviour
+
+`ChartUIEnabled()` returns false during optimization passes and non-visual
+backtests, which skips **all** of the above — object creation, panel
+rendering, level lines and the history rescan behind the P&L table. Visual
+mode keeps the full UI, since watching the panel and the level lines is the
+whole point of a visual run. Basket peak/trough tracking
+(`TrackBasketExtremes()`) is trading state, not UI, so it always runs.
 
 ## 10. Input parameter reference
 

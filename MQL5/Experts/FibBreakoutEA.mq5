@@ -3,7 +3,7 @@
 //|         MT5 XAUUSD Fibonacci Breakout + Averaging Expert Advisor |
 //+------------------------------------------------------------------+
 #property copyright "FibBreakoutEA"
-#property version   "1.02"
+#property version   "1.03"
 #property strict
 #property description "Breakout (BUY STOP / SELL STOP) entry with Fibonacci-lot averaging,"
 #property description "virtual weighted-average basket take-profit, and layered risk controls."
@@ -219,8 +219,29 @@ double  g_fibLots[64];
 int     g_fibCount = 0;
 
 string  g_dashLines[100];
+color   g_dashColors[100];
 int     g_dashLineCount = 0;
 uint    g_lastDashboardUpdate = 0;
+
+// Manual override from the on-chart buttons. Blocks new cycles only - an
+// already-open basket keeps being managed (TP, risk, market-close guard).
+bool    g_userPaused = false;
+
+// Worst floating basket P/L seen during the current cycle, the mirror of
+// g_basketPeakProfit. Purely diagnostic: shows how deep a winning basket
+// actually went before it recovered.
+double  g_basketWorstProfit = 0;
+
+// Closed-P/L statistics, rebuilt from deal history only when the history
+// actually changes (or every few seconds), never on every tick.
+double   g_dayProfit[5];
+double   g_dayLots[5];
+datetime g_dayStart[5];
+datetime g_dayEnd[5];
+double   g_weekProfit = 0, g_monthProfit = 0, g_yearProfit = 0, g_allProfit = 0;
+double   g_weekLots   = 0, g_monthLots   = 0, g_yearLots   = 0, g_allLots   = 0;
+int      g_lastHistoryDeals = -1;
+datetime g_lastHistoryCalc  = 0;
 
 #define DASH_PREFIX      "FibEA_DASH_"
 #define DASH_X           10
@@ -228,6 +249,22 @@ uint    g_lastDashboardUpdate = 0;
 #define DASH_LINE_HEIGHT 13
 #define DASH_FONT_SIZE   8
 #define DASH_FONT        "Consolas"
+#define DASH_PANEL_NAME  "FibEA_PANEL"
+#define DASH_PANEL_W     300
+
+#define LINE_AVG         "FibEA_LINE_AVG"
+#define LINE_TP          "FibEA_LINE_TP"
+#define LINE_NEXT        "FibEA_LINE_NEXT"
+#define BTN_PREFIX       "FibEA_BTN_"
+#define BTN_CLOSE_BASKET "FibEA_BTN_CloseBasket"
+#define BTN_CANCEL_PEND  "FibEA_BTN_CancelPending"
+#define BTN_PAUSE        "FibEA_BTN_Pause"
+#define BTN_FLATTEN      "FibEA_BTN_Flatten"
+#define BTN_W            132
+#define BTN_H            24
+#define BTN_GAP          28
+
+#define HISTORY_REFRESH_SECONDS 5
 
 // Not an input by design: the broker's real session close time is read
 // directly from the symbol's own trading-session schedule (SymbolInfoSessionTrade),
@@ -310,10 +347,26 @@ string StateToString(EAState s);
 string DirectionToString(ENUM_BASKET_DIRECTION d);
 void   WriteTradeLog(string category, string message);
 void   LogError(string message);
-void   AddDashLine(string text);
+void   AddDashLine(string text, color clr = clrWhite);
 void   RenderDashboard();
 void   RemoveDashboard();
 void   UpdateDashboard();
+bool   ChartUIEnabled();
+color  PnlColor(double value);
+void   TrackBasketExtremes();
+datetime TradingDayStart(int daysAgo);
+datetime CurrentWeekStart();
+datetime CurrentMonthStart();
+datetime CurrentYearStart();
+void   UpdateHistoryStats();
+void   DrawBasketLevels();
+void   DrawLevelLine(string name, double price, color clr, ENUM_LINE_STYLE style, string text);
+void   RemoveBasketLevels();
+void   CreateControlButtons();
+void   CreateControlButton(string name, string text, int slot, color bg);
+void   SetButtonText(string name, string text);
+void   RemoveControlButtons();
+void   HandleButtonClick(string name);
 
 //======================================================================
 // EVENT HANDLERS
@@ -373,6 +426,7 @@ int OnInit()
    }
 
    EventSetTimer(1);
+   CreateControlButtons();
    UpdateDashboard();
    return(INIT_SUCCEEDED);
 }
@@ -381,6 +435,8 @@ void OnDeinit(const int reason)
 {
    EventKillTimer();
    RemoveDashboard();
+   RemoveControlButtons();
+   RemoveBasketLevels();
    if(g_atrHandle != INVALID_HANDLE)     IndicatorRelease(g_atrHandle);
    if(g_atrGridHandle != INVALID_HANDLE) IndicatorRelease(g_atrGridHandle);
    if(g_emaFastHandle != INVALID_HANDLE) IndicatorRelease(g_emaFastHandle);
@@ -427,6 +483,7 @@ void OnTick()
       case STATE_SELL_ACTIVE:
          RecalculateBasketMetrics(g_basketDirection);
          SyncBrokerSideTakeProfit(g_basketDirection);
+         TrackBasketExtremes();
 
          if(IsNearMarketClose())
          {
@@ -813,6 +870,7 @@ void ActivateBasket(ENUM_BASKET_DIRECTION direction, bool cancelOpposite)
    SyncBrokerSideTakeProfit(direction);
    g_profitLockArmed = false;
    g_basketPeakProfit = 0;
+   g_basketWorstProfit = 0;
    g_state = (direction == BASKET_BUY) ? STATE_BUY_ACTIVE : STATE_SELL_ACTIVE;
 
    if(cancelOpposite)
@@ -872,6 +930,7 @@ void HandleEmergencyBothSides()
 bool CanStartNewCycle()
 {
    if(g_eaDisabled)                                   return false;
+   if(g_userPaused)                                   return false;
    if(g_dailyLossTriggered || g_equityDrawdownTriggered) return false;
    if(CountAllEAPositions() > 0)                      return false;
    if(CountPendingOrders() > 0)                       return false;
@@ -1401,9 +1460,9 @@ void CheckProfitLock()
    if(!EnableProfitLock) return;
    if(g_basketDirection == BASKET_NONE) return;
 
+   // g_basketPeakProfit is maintained by TrackBasketExtremes(), which runs
+   // earlier in the same OnTick branch - do not track it a second time here.
    double profit = CalculateBasketProfit(g_basketDirection);
-   if(profit > g_basketPeakProfit)
-      g_basketPeakProfit = profit;
 
    if(!g_profitLockArmed)
    {
@@ -1518,6 +1577,7 @@ void EnterCooldown()
    g_basketLossActionExecuted = false;
    g_profitLockArmed = false;
    g_basketPeakProfit = 0;
+   g_basketWorstProfit = 0;
    g_weightedAverage = 0;
    g_basketTP = 0;
    g_lastEntryPrice = 0;
@@ -1933,17 +1993,382 @@ void LogError(string message)
 }
 
 //======================================================================
+// CLOSED-P/L STATISTICS (rebuilt from deal history, heavily throttled)
+//======================================================================
+
+// Midnight of the trading day `daysAgo` weekdays back. Saturday/Sunday are
+// skipped as day *labels*, but nothing is lost: because each bucket runs
+// from its own start up to the next newer bucket's start, weekend and
+// Sunday-evening deals fold into the preceding Friday row.
+datetime TradingDayStart(int daysAgo)
+{
+   datetime day = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
+   MqlDateTime dt;
+
+   TimeToStruct(day, dt);
+   while(dt.day_of_week == 0 || dt.day_of_week == 6)
+   {
+      day -= 86400;
+      TimeToStruct(day, dt);
+   }
+
+   for(int i = 0; i < daysAgo; i++)
+   {
+      day -= 86400;
+      TimeToStruct(day, dt);
+      while(dt.day_of_week == 0 || dt.day_of_week == 6)
+      {
+         day -= 86400;
+         TimeToStruct(day, dt);
+      }
+   }
+   return day;
+}
+
+datetime CurrentWeekStart()
+{
+   datetime day = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
+   MqlDateTime dt;
+   TimeToStruct(day, dt);
+
+   if(dt.day_of_week == 0) return day; // Sunday evening opens the new FX week
+
+   while(dt.day_of_week != 1)
+   {
+      day -= 86400;
+      TimeToStruct(day, dt);
+   }
+   return day;
+}
+
+datetime CurrentMonthStart()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   return StringToTime(StringFormat("%04d.%02d.01", dt.year, dt.mon));
+}
+
+datetime CurrentYearStart()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   return StringToTime(StringFormat("%04d.01.01", dt.year));
+}
+
+// One pass over the deal history fills every bucket at once. Rebuilt only
+// when the number of deals actually changed, or once every
+// HISTORY_REFRESH_SECONDS - never per tick, which would be far too costly
+// on an account with a long history.
+void UpdateHistoryStats()
+{
+   datetime now = TimeCurrent();
+
+   int dealsNow = -1;
+   if(HistorySelect(0, now + 86400))
+      dealsNow = HistoryDealsTotal();
+
+   if(dealsNow == g_lastHistoryDeals && (now - g_lastHistoryCalc) < HISTORY_REFRESH_SECONDS)
+      return;
+
+   g_lastHistoryDeals = dealsNow;
+   g_lastHistoryCalc  = now;
+
+   for(int i = 0; i < 5; i++)
+   {
+      g_dayStart[i]  = TradingDayStart(i);
+      g_dayEnd[i]    = (i == 0) ? now + 86400 : g_dayStart[i - 1];
+      g_dayProfit[i] = 0;
+      g_dayLots[i]   = 0;
+   }
+
+   g_weekProfit  = 0; g_weekLots  = 0;
+   g_monthProfit = 0; g_monthLots = 0;
+   g_yearProfit  = 0; g_yearLots  = 0;
+   g_allProfit   = 0; g_allLots   = 0;
+
+   if(dealsNow <= 0) return;
+
+   datetime weekStart  = CurrentWeekStart();
+   datetime monthStart = CurrentMonthStart();
+   datetime yearStart  = CurrentYearStart();
+
+   for(int i = 0; i < dealsNow; i++)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0) continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != g_symbol) continue;
+      if((long)HistoryDealGetInteger(ticket, DEAL_MAGIC) != (long)MagicNumber) continue;
+
+      long dealType = HistoryDealGetInteger(ticket, DEAL_TYPE);
+      if(dealType != DEAL_TYPE_BUY && dealType != DEAL_TYPE_SELL) continue;
+
+      long entry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY && entry != DEAL_ENTRY_INOUT)
+         continue;
+
+      datetime dealTime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      double   net      = HistoryDealGetDouble(ticket, DEAL_PROFIT)
+                        + HistoryDealGetDouble(ticket, DEAL_SWAP)
+                        + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+      double   vol      = HistoryDealGetDouble(ticket, DEAL_VOLUME);
+
+      g_allProfit += net; g_allLots += vol;
+      if(dealTime >= yearStart)  { g_yearProfit  += net; g_yearLots  += vol; }
+      if(dealTime >= monthStart) { g_monthProfit += net; g_monthLots += vol; }
+      if(dealTime >= weekStart)  { g_weekProfit  += net; g_weekLots  += vol; }
+
+      for(int d = 0; d < 5; d++)
+      {
+         if(dealTime >= g_dayStart[d] && dealTime < g_dayEnd[d])
+         {
+            g_dayProfit[d] += net;
+            g_dayLots[d]   += vol;
+            break;
+         }
+      }
+   }
+}
+
+// Peak and trough of the current basket's floating P/L. Single source of
+// truth for both - CheckProfitLock() reads g_basketPeakProfit rather than
+// tracking it again, so this must run first in the active-basket branch.
+void TrackBasketExtremes()
+{
+   if(g_basketDirection == BASKET_NONE) return;
+
+   double profit = CalculateBasketProfit(g_basketDirection);
+   if(profit > g_basketPeakProfit)  g_basketPeakProfit  = profit;
+   if(profit < g_basketWorstProfit) g_basketWorstProfit = profit;
+}
+
+//======================================================================
+// CHART LEVEL LINES
+//======================================================================
+void DrawLevelLine(string name, double price, color clr, ENUM_LINE_STYLE style, string text)
+{
+   long chartId = 0;
+
+   if(price <= 0)
+   {
+      ObjectDelete(chartId, name);
+      return;
+   }
+
+   if(ObjectFind(chartId, name) < 0)
+   {
+      if(!ObjectCreate(chartId, name, OBJ_HLINE, 0, 0, price))
+         return;
+      ObjectSetInteger(chartId, name, OBJPROP_COLOR, clr);
+      ObjectSetInteger(chartId, name, OBJPROP_STYLE, style);
+      ObjectSetInteger(chartId, name, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(chartId, name, OBJPROP_BACK, true);
+      ObjectSetInteger(chartId, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(chartId, name, OBJPROP_HIDDEN, true);
+   }
+
+   ObjectSetDouble(chartId, name, OBJPROP_PRICE, price);
+   ObjectSetString(chartId, name, OBJPROP_TOOLTIP, text + " " + PxStr(price));
+   ObjectSetString(chartId, name, OBJPROP_TEXT, text);
+}
+
+// Puts the numbers the dashboard reports where they actually mean
+// something - on the price axis, next to the candles that will hit them.
+void DrawBasketLevels()
+{
+   if(!ChartUIEnabled()) return;
+
+   if(g_basketDirection == BASKET_NONE || g_currentLevel <= 0)
+   {
+      RemoveBasketLevels();
+      return;
+   }
+
+   DrawLevelLine(LINE_AVG,  g_weightedAverage,    clrGoldenrod, STYLE_SOLID, "Basket average");
+   DrawLevelLine(LINE_TP,   g_basketTP,           clrLimeGreen, STYLE_DASH,  "Basket TP");
+   DrawLevelLine(LINE_NEXT, g_nextAveragingPrice, clrTomato,    STYLE_DOT,   "Next averaging level");
+}
+
+void RemoveBasketLevels()
+{
+   long chartId = 0;
+   ObjectDelete(chartId, LINE_AVG);
+   ObjectDelete(chartId, LINE_TP);
+   ObjectDelete(chartId, LINE_NEXT);
+}
+
+//======================================================================
+// MANUAL CONTROL BUTTONS
+//======================================================================
+void CreateControlButtons()
+{
+   if(!ChartUIEnabled()) return;
+
+   CreateControlButton(BTN_FLATTEN,      "Flatten + Pause", 3, C'140,40,40');
+   CreateControlButton(BTN_CLOSE_BASKET, "Close Basket",    2, C'110,60,40');
+   CreateControlButton(BTN_CANCEL_PEND,  "Cancel Pending",  1, C'60,70,95');
+   CreateControlButton(BTN_PAUSE,        g_userPaused ? "Resume EA" : "Pause EA", 0, C'95,80,35');
+}
+
+void CreateControlButton(string name, string text, int slot, color bg)
+{
+   long chartId = 0;
+
+   if(ObjectFind(chartId, name) < 0)
+   {
+      if(!ObjectCreate(chartId, name, OBJ_BUTTON, 0, 0, 0))
+         return;
+      ObjectSetInteger(chartId, name, OBJPROP_CORNER, CORNER_RIGHT_LOWER);
+      ObjectSetInteger(chartId, name, OBJPROP_XDISTANCE, 10 + BTN_W);
+      ObjectSetInteger(chartId, name, OBJPROP_YDISTANCE, 10 + slot * BTN_GAP);
+      ObjectSetInteger(chartId, name, OBJPROP_XSIZE, BTN_W);
+      ObjectSetInteger(chartId, name, OBJPROP_YSIZE, BTN_H);
+      ObjectSetInteger(chartId, name, OBJPROP_BGCOLOR, bg);
+      ObjectSetInteger(chartId, name, OBJPROP_COLOR, clrWhite);
+      ObjectSetInteger(chartId, name, OBJPROP_BORDER_COLOR, clrDimGray);
+      ObjectSetString(chartId, name, OBJPROP_FONT, "Arial");
+      ObjectSetInteger(chartId, name, OBJPROP_FONTSIZE, 9);
+      ObjectSetInteger(chartId, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(chartId, name, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(chartId, name, OBJPROP_STATE, false);
+      ObjectSetInteger(chartId, name, OBJPROP_BACK, false);
+   }
+
+   ObjectSetString(chartId, name, OBJPROP_TEXT, text);
+}
+
+void SetButtonText(string name, string text)
+{
+   if(ObjectFind(0, name) >= 0)
+      ObjectSetString(0, name, OBJPROP_TEXT, text);
+}
+
+void RemoveControlButtons()
+{
+   long chartId = 0;
+   ObjectDelete(chartId, BTN_CLOSE_BASKET);
+   ObjectDelete(chartId, BTN_CANCEL_PEND);
+   ObjectDelete(chartId, BTN_PAUSE);
+   ObjectDelete(chartId, BTN_FLATTEN);
+}
+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   if(id != CHARTEVENT_OBJECT_CLICK) return;
+   if(StringFind(sparam, BTN_PREFIX) != 0) return;
+
+   ObjectSetInteger(0, sparam, OBJPROP_STATE, false); // buttons act, they don't latch
+   HandleButtonClick(sparam);
+   ChartRedraw(0);
+}
+
+// Every action here routes through the same functions the automated logic
+// uses, so a manual intervention leaves the state machine consistent
+// rather than bypassing it.
+void HandleButtonClick(string name)
+{
+   if(g_tradeLock)
+   {
+      WriteTradeLog("BUTTON", "Click ignored - a trade operation is already in progress. Try again.");
+      return;
+   }
+   g_tradeLock = true;
+
+   if(name == BTN_CLOSE_BASKET)
+   {
+      if(CountAllEAPositions() > 0)
+      {
+         WriteTradeLog("BUTTON", "Manual basket close requested.");
+         BeginBasketClose();
+      }
+      else
+      {
+         WriteTradeLog("BUTTON", "Manual basket close requested, but no EA positions are open.");
+      }
+   }
+   else if(name == BTN_CANCEL_PEND)
+   {
+      WriteTradeLog("BUTTON", "Manual cancel of pending breakout orders requested.");
+      CancelAllPendingOrders();
+      if(g_state == STATE_WAITING_FOR_BREAKOUT)
+      {
+         g_state = STATE_COOLDOWN;
+         g_cooldownStart = TimeCurrent();
+      }
+   }
+   else if(name == BTN_PAUSE)
+   {
+      g_userPaused = !g_userPaused;
+      WriteTradeLog("BUTTON", g_userPaused ?
+                    "EA paused manually. Open baskets are still managed; no new cycles will start." :
+                    "EA resumed manually.");
+      SetButtonText(BTN_PAUSE, g_userPaused ? "Resume EA" : "Pause EA");
+   }
+   else if(name == BTN_FLATTEN)
+   {
+      WriteTradeLog("BUTTON", "Manual flatten requested: cancelling pendings, closing all EA positions, pausing.");
+      CancelAllPendingOrders();
+      CloseAllEAPositions();
+      g_userPaused = true;
+      SetButtonText(BTN_PAUSE, "Resume EA");
+      if(CountAllEAPositions() == 0)
+         EnterCooldown();
+   }
+
+   g_tradeLock = false;
+}
+
+//======================================================================
 // DASHBOARD
 //======================================================================
-void AddDashLine(string text)
+// Nobody is watching a chart during an optimization pass or a non-visual
+// backtest, so every object operation and every history rescan behind the
+// dashboard is pure overhead there. Visual-mode tests keep the full UI,
+// since watching the panel and the level lines is the whole point of them.
+bool ChartUIEnabled()
+{
+   if(MQLInfoInteger(MQL_OPTIMIZATION)) return false;
+   if(MQLInfoInteger(MQL_TESTER) && !MQLInfoInteger(MQL_VISUAL_MODE)) return false;
+   return true;
+}
+
+color PnlColor(double value)
+{
+   if(value > 0) return clrLimeGreen;
+   if(value < 0) return clrTomato;
+   return clrSilver;
+}
+
+void AddDashLine(string text, color clr)
 {
    if(g_dashLineCount < 100)
+   {
+      g_dashColors[g_dashLineCount] = clr;
       g_dashLines[g_dashLineCount++] = text;
+   }
 }
 
 void RenderDashboard()
 {
+   if(!ChartUIEnabled()) return;
+
    long chartId = 0;
+
+   if(ObjectFind(chartId, DASH_PANEL_NAME) < 0)
+   {
+      ObjectCreate(chartId, DASH_PANEL_NAME, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+      ObjectSetInteger(chartId, DASH_PANEL_NAME, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(chartId, DASH_PANEL_NAME, OBJPROP_XDISTANCE, DASH_X - 6);
+      ObjectSetInteger(chartId, DASH_PANEL_NAME, OBJPROP_YDISTANCE, DASH_Y_START - 8);
+      ObjectSetInteger(chartId, DASH_PANEL_NAME, OBJPROP_XSIZE, DASH_PANEL_W);
+      ObjectSetInteger(chartId, DASH_PANEL_NAME, OBJPROP_BGCOLOR, C'18,20,24');
+      ObjectSetInteger(chartId, DASH_PANEL_NAME, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(chartId, DASH_PANEL_NAME, OBJPROP_COLOR, clrDimGray);
+      ObjectSetInteger(chartId, DASH_PANEL_NAME, OBJPROP_BACK, false);
+      ObjectSetInteger(chartId, DASH_PANEL_NAME, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(chartId, DASH_PANEL_NAME, OBJPROP_HIDDEN, true);
+   }
+   ObjectSetInteger(chartId, DASH_PANEL_NAME, OBJPROP_YSIZE, g_dashLineCount * DASH_LINE_HEIGHT + 16);
+
    for(int i = 0; i < g_dashLineCount; i++)
    {
       string name = DASH_PREFIX + IntegerToString(i);
@@ -1955,13 +2380,14 @@ void RenderDashboard()
          ObjectSetInteger(chartId, name, OBJPROP_YDISTANCE, DASH_Y_START + i * DASH_LINE_HEIGHT);
          ObjectSetString(chartId, name, OBJPROP_FONT, DASH_FONT);
          ObjectSetInteger(chartId, name, OBJPROP_FONTSIZE, DASH_FONT_SIZE);
-         ObjectSetInteger(chartId, name, OBJPROP_COLOR, clrWhite);
          ObjectSetInteger(chartId, name, OBJPROP_SELECTABLE, false);
          ObjectSetInteger(chartId, name, OBJPROP_HIDDEN, true);
          ObjectSetInteger(chartId, name, OBJPROP_BACK, false);
       }
       ObjectSetString(chartId, name, OBJPROP_TEXT, g_dashLines[i]);
+      ObjectSetInteger(chartId, name, OBJPROP_COLOR, g_dashColors[i]);
    }
+
    ChartRedraw(chartId);
 }
 
@@ -1970,10 +2396,16 @@ void RemoveDashboard()
    long chartId = 0;
    for(int i = 0; i < 100; i++)
       ObjectDelete(chartId, DASH_PREFIX + IntegerToString(i));
+   ObjectDelete(chartId, DASH_PANEL_NAME);
 }
 
 void UpdateDashboard()
 {
+   if(!ChartUIEnabled()) return;
+
+   UpdateHistoryStats();
+   DrawBasketLevels();
+
    g_dashLineCount = 0;
 
    double bid = SymbolInfoDouble(g_symbol, SYMBOL_BID);
@@ -1993,13 +2425,15 @@ void UpdateDashboard()
    int nextLevel = (int)MathMin((double)(g_currentLevel + 1), (double)MaximumMartingaleLevels);
    double nextLot = GetFibonacciLot(nextLevel);
 
-   AddDashLine("== FIBONACCI BREAKOUT EA ==");
+   AddDashLine("== FIBONACCI BREAKOUT EA ==", clrGold);
    AddDashLine("Symbol: " + g_symbol);
-   AddDashLine("Account Type: " + GetAccountMarginModeString() + (g_isHedgingAccount ? "" : " (WARNING)"));
-   AddDashLine("EA State: " + StateToString(g_state));
-   AddDashLine("--------------------------------");
+   AddDashLine("Account Type: " + GetAccountMarginModeString() + (g_isHedgingAccount ? "" : " (WARNING)"),
+               g_isHedgingAccount ? clrWhite : clrTomato);
+   AddDashLine("EA State: " + StateToString(g_state) + (g_userPaused ? "  [PAUSED]" : ""),
+               g_userPaused ? clrOrange : clrWhite);
+   AddDashLine("--------------------------------", clrDimGray);
    AddDashLine("Bid: " + PxStr(bid) + "   Ask: " + PxStr(ask));
-   AddDashLine("Spread: " + PxStr(spread));
+   AddDashLine(StringFormat("Spread: %s   Leverage: 1:%d", PxStr(spread), (int)AccountInfoInteger(ACCOUNT_LEVERAGE)));
    AddDashLine("--------------------------------");
    AddDashLine("Cycle ID: " + g_cycleIdFull);
    AddDashLine("Direction: " + DirectionToString(g_basketDirection));
@@ -2014,27 +2448,50 @@ void UpdateDashboard()
                StringFormat("ATR (Entry=%s Grid=%s TP=%s)", PxStr(g_effEntryDistance), PxStr(g_effGridStep), PxStr(g_effBasketTPDistance)) :
                "Fixed"));
    AddDashLine(StringFormat("Next Fibonacci Lot: %.2f", nextLot));
-   AddDashLine("--------------------------------");
-   AddDashLine(StringFormat("Floating P/L: %.2f", floatingPL));
-   AddDashLine(StringFormat("Basket P/L: %.2f", basketPL));
+   AddDashLine("--------------------------------", clrDimGray);
+   AddDashLine(StringFormat("Floating P/L: %.2f", floatingPL), PnlColor(floatingPL));
+   AddDashLine(StringFormat("Basket P/L: %.2f", basketPL), PnlColor(basketPL));
+   AddDashLine(StringFormat("Basket best/worst: %.2f / %.2f", g_basketPeakProfit, g_basketWorstProfit),
+               PnlColor(g_basketWorstProfit));
    AddDashLine("Profit Lock: " + (!EnableProfitLock ? "OFF" : (g_profitLockArmed ? StringFormat("ARMED (peak %.2f)", g_basketPeakProfit) : StringFormat("watching (peak %.2f)", g_basketPeakProfit))));
    AddDashLine(StringFormat("Equity: %.2f", equity));
    AddDashLine(StringFormat("Balance: %.2f", balance));
    AddDashLine(StringFormat("Free Margin: %.2f", freeMargin));
    AddDashLine(StringFormat("Margin Level: %.2f%%", marginLevel));
-   AddDashLine("--------------------------------");
-   AddDashLine(StringFormat("Daily P/L: %.2f (%.2f%%)", dailyPL, dailyPLPercent));
-   AddDashLine(StringFormat("Drawdown: %.2f%%", ddPercent));
-   AddDashLine("--------------------------------");
-   AddDashLine("Spread Status: " + (IsSpreadAcceptable() ? "OK" : "BLOCKED"));
-   AddDashLine("Margin Status: " + (g_marginProtectionTriggered ? "BLOCKED" : "OK"));
+   AddDashLine("--------------------------------", clrDimGray);
+   AddDashLine(StringFormat("Daily P/L: %.2f (%.2f%%)", dailyPL, dailyPLPercent), PnlColor(dailyPL));
+   AddDashLine(StringFormat("Drawdown: %.2f%%", ddPercent), ddPercent > 0 ? clrTomato : clrSilver);
+   AddDashLine("------ CLOSED P/L (this EA) ------", clrDimGray);
+   AddDashLine(StringFormat("Today : %9.2f  (%.2f lots)", g_dayProfit[0], g_dayLots[0]), PnlColor(g_dayProfit[0]));
+   for(int d = 1; d < 5; d++)
+   {
+      MqlDateTime dayStruct;
+      TimeToStruct(g_dayStart[d], dayStruct);
+      AddDashLine(StringFormat("%02d.%02d : %9.2f  (%.2f lots)",
+                  dayStruct.day, dayStruct.mon, g_dayProfit[d], g_dayLots[d]), PnlColor(g_dayProfit[d]));
+   }
+   AddDashLine(StringFormat("Week  : %9.2f  (%.2f lots)", g_weekProfit,  g_weekLots),  PnlColor(g_weekProfit));
+   AddDashLine(StringFormat("Month : %9.2f  (%.2f lots)", g_monthProfit, g_monthLots), PnlColor(g_monthProfit));
+   AddDashLine(StringFormat("Year  : %9.2f  (%.2f lots)", g_yearProfit,  g_yearLots),  PnlColor(g_yearProfit));
+   AddDashLine(StringFormat("All   : %9.2f  (%.2f lots)", g_allProfit,   g_allLots),   PnlColor(g_allProfit));
+   AddDashLine("--------------------------------", clrDimGray);
+   bool spreadOk = IsSpreadAcceptable();
+   bool riskOk   = !g_eaDisabled && !g_dailyLossTriggered && !g_equityDrawdownTriggered;
+   bool closeSoon = IsNearMarketClose();
+
+   AddDashLine("Spread Status: " + (spreadOk ? "OK" : "BLOCKED"), spreadOk ? clrSilver : clrTomato);
+   AddDashLine("Margin Status: " + (g_marginProtectionTriggered ? "BLOCKED" : "OK"),
+               g_marginProtectionTriggered ? clrTomato : clrSilver);
    AddDashLine("Risk Status: " + (g_eaDisabled ? "DISABLED" :
                                   (g_dailyLossTriggered ? "DAILY LOSS STOP" :
-                                  (g_equityDrawdownTriggered ? "EQUITY DD STOP" : "OK"))));
+                                  (g_equityDrawdownTriggered ? "EQUITY DD STOP" : "OK"))),
+               riskOk ? clrSilver : clrTomato);
    AddDashLine("Trading Hours: " + (EnableTradingHours ? (IsWithinTradingHours() ? "OPEN" : "CLOSED") : "N/A"));
-   AddDashLine("Market Close Guard: " + (IsNearMarketClose() ? "CLOSING SOON" : "OK"));
+   AddDashLine("Market Close Guard: " + (closeSoon ? "CLOSING SOON" : "OK"),
+               closeSoon ? clrOrange : clrSilver);
    AddDashLine("ATR Status: " + (EnableATRFilter ? (IsVolatilityAcceptable() ? "OK" : "BLOCKED") : "N/A"));
-   AddDashLine("Averaging Blocked: " + (g_averagingHardBlocked ? "YES (hard)" : (g_averagingBlocked ? "YES" : "NO")));
+   AddDashLine("Averaging Blocked: " + (g_averagingHardBlocked ? "YES (hard)" : (g_averagingBlocked ? "YES" : "NO")),
+               (g_averagingHardBlocked || g_averagingBlocked) ? clrOrange : clrSilver);
 
    RenderDashboard();
 }
